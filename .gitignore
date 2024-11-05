@@ -1,0 +1,14 @@
+
+
+*.pyc
+*.pyo
+*.pyd
+*.pyz
+*.pyw
+*.jpg
+
+
+.env
+
+heatmap/
+notes/

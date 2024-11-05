@@ -1,0 +1,11 @@
+colpali_engine==0.3.3
+fastapi==0.115.4
+huggingface_hub==0.26.2
+matplotlib==3.9.2
+Pillow==10.4.0
+pydantic==2.9.2
+torch==2.4.1
+uvicorn==0.32.0
+einops==0.8.0
+seaborn==0.13.2
+python-multipart==0.0.12
