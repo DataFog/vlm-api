@@ -12,3 +12,17 @@
 
 heatmap/
 notes/
+.DS_Store
+**/.DS_Store
+result/
+result.zip
+
+app/__pycache__/
+app/venv/
+app/.venv/
+
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif

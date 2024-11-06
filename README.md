@@ -31,51 +31,27 @@ Uploading the image below and querying "Find PageRank", you can see the attentio
 
 ## API Endpoints
 
-### POST /query/single
-Computes similarity between image and text query.
+The API provides endpoints for analyzing images and PDFs:
 
+### PDF Analysis
+
+**POST /query/pdf**
+
+Process PDF documents with semantic search and highlighting.
+
+Request:
 ```bash
-curl -X POST http://localhost:8000/query/single \
--F "file=@image.jpg" \
--F "query=text query"
+curl -X POST \
+  -F "file=@document.pdf" \
+  -F "query=text query" \
+  -F "top_k=3" \
+  http://localhost:8000/query/pdf \
+  --output result.zip
 ```
 
 Response:
-```json
-{
-    "query": "text query",
-    "overall_similarity": 0.85,
-    "tokens": {
-        "token": {
-            "token_idx": 0,
-            "max_similarity_score": 0.85,
-            "avg_similarity_score": 0.45,
-            "hotspots": [
-                {"x": 15, "y": 20, "score": 0.85},
-                ...
-            ]
-        }
-    }
-}
-```
 
-### POST /query/single/heatmap
-Generates attention visualization maps.
-
-```bash
-# Single token heatmap
-curl -X POST http://localhost:8000/query/single/heatmap \
--F "file=@image.jpg" \
--F "query=text query" \
--F "token_idx=0" \
--o heatmap.png
-
-# All tokens (returns ZIP with multiple heatmaps)
-curl -X POST http://localhost:8000/query/single/heatmap \
--F "file=@image.jpg" \
--F "query=text query" \
--o heatmaps.zip
-```
+ZIP file containing highlighted PDF and similarity scores titled result.zip
 
 ## Setup
 

@@ -1,13 +1,14 @@
-"""FastAPI service for the VLM vision-language model that provides similarity analysis between images and text queries.
+# """FastAPI service for the VLM vision-language model that provides similarity analysis between images and text queries.
 
-This module implements a REST API for analyzing similarity between images and text queries using the ColPaLI model.
-It provides endpoints for single image queries and heatmap generation.
-"""
+# This module implements a REST API for analyzing similarity between images and text queries using the ColPaLI model.
+# It provides endpoints for single image queries and heatmap generation.
+# """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import torch
+from torch.utils.data import DataLoader
 from PIL import Image
 import io
 from typing import List, Optional
@@ -24,9 +25,78 @@ import zipfile
 from colpali_engine.models import ColPali, ColPaliProcessor
 from colpali_engine.utils.torch_utils import get_torch_device
 from colpali_engine.interpretability import get_similarity_maps_from_embeddings
+import requests
+from pdf2image import convert_from_path
+from pypdf import PdfReader
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import Color
+from PyPDF2 import PdfReader, PdfWriter
+import shutil
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form, BackgroundTasks
+from PIL import Image
+import torch
+import numpy as np
+from typing import List, Tuple, Dict
+import tempfile
+import os
+import zipfile
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import Color
+from PyPDF2 import PdfReader, PdfWriter
+import io
+from pdf2image import convert_from_path
+import spacy
+from transformers import AutoTokenizer
+import json
+def download_pdf(url):
+    response = requests.get(url)
+    if response.status_code == 200:
+        # Convert response content to BytesIO object for in-memory PDF handling
+        # Returns: BytesIO object containing the downloaded PDF content
+        # Requires: response.content is valid PDF data
+        # Ensures: Returns a readable BytesIO object
+        return BytesIO(response.content)
+    else:
+        raise Exception(f"Failed to download PDF: Status code {response.status_code}")
+
+
+def get_pdf_images(pdf_path, is_local=True):
+    """Get images and text from PDF file."""
+    try:
+        if not is_local:
+            pdf_file = download_pdf(pdf_path)
+            with open("temp.pdf", "wb") as f:
+                f.write(pdf_file.read())
+            pdf_path = "temp.pdf"
+        
+        # Extract text first
+        reader = PdfReader(pdf_path)
+        page_texts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            page_texts.append(text)
+        
+        # Convert to images with specific DPI and use poppler
+        images = convert_from_path(
+            pdf_path,
+            dpi=200,  # Adjust DPI as needed
+            poppler_path=None,  # Set this to your poppler path if needed
+            fmt='PIL'
+        )
+        
+        if not images:
+            raise ValueError("No images extracted from PDF")
+            
+        print(f"Extracted {len(images)} images and {len(page_texts)} text pages")
+        return images, page_texts
+        
+    except Exception as e:
+        print(f"PDF processing error: {str(e)}")
+        raise
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 # Global model variables
 model = None  # ColPaLI model instance
@@ -57,7 +127,7 @@ async def lifespan(app: FastAPI):
     Args:
         app (FastAPI): FastAPI application instance
     """
-    global model, processor, device
+    global model, processor, device, nlp
     
     # Startup
     hf_token = os.getenv("HF_TOKEN")
@@ -78,12 +148,20 @@ async def lifespan(app: FastAPI):
     
     processor = ColPaliProcessor.from_pretrained(model_name)
     
+    print("Loading spaCy model...")
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        print("Installing spacy model...")
+        os.system("python -m spacy download en_core_web_sm")
+        nlp = spacy.load("en_core_web_sm")
+    
     yield
     
     # Shutdown cleanup
     model = None
     processor = None
-
+    nlp = None
 app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
@@ -210,8 +288,8 @@ async def query_image(
         print(f"Error during image analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/query/single/heatmap")
-async def query_single_image_heatmap(
+@app.post("/similarity/heatmaps")
+async def generate_similarity_heatmaps(
     file: UploadFile = File(...),
     query: str = Form(...),
     token_idx: Optional[int] = Form(None),
@@ -340,6 +418,210 @@ async def query_single_image_heatmap(
             import shutil
             shutil.rmtree(temp_dir)
         print(f"Error generating heatmap: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+def extract_key_terms(query: str, nlp) -> List[str]:
+    """Extract important terms from query using spaCy."""
+    doc = nlp(query)
+    key_terms = []
+    
+    # Extract named entities
+    key_terms.extend([ent.text for ent in doc.ents])
+    
+    # Extract noun phrases and numbers
+    key_terms.extend([chunk.text for chunk in doc.noun_chunks])
+    key_terms.extend([token.text for token in doc if token.like_num])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    key_terms = [x for x in key_terms if not (x in seen or seen.add(x))]
+    
+    return key_terms
+
+def create_highlighted_pdf(original_pdf_path: str, 
+                         highlights: List[Dict],
+                         output_path: str):
+    """Create a new PDF with highlights overlaid on matching pages."""
+    reader = PdfReader(original_pdf_path)
+    writer = PdfWriter()
+    
+    for page_num in range(len(reader.pages)):
+        page = reader.pages[page_num]
+        page_highlights = [h for h in highlights if h["page_num"] == page_num]
+        
+        if page_highlights:
+            # Create highlight layer
+            packet = io.BytesIO()
+            can = canvas.Canvas(packet)
+            
+            for highlight in page_highlights:
+                # Convert normalized coordinates to PDF coordinates
+                x, y = highlight["bbox"]
+                width = page.mediabox.width
+                height = page.mediabox.height
+                
+                # Draw semi-transparent yellow highlight
+                can.setFillColor(Color(1, 1, 0, alpha=0.3))
+                can.rect(x * width, y * height, 
+                        highlight["width"] * width,
+                        highlight["height"] * height,
+                        fill=True, stroke=False)
+            
+            can.save()
+            packet.seek(0)
+            
+            # Merge highlight layer with original page
+            highlight_pdf = PdfReader(packet)
+            page.merge_page(highlight_pdf.pages[0])
+        
+        writer.add_page(page)
+    
+    with open(output_path, "wb") as output_file:
+        writer.write(output_file)
+
+@app.post("/query/pdf")
+async def query_pdf(
+    file: UploadFile = File(...),
+    query: str = Form(...),
+    top_k: int = Form(3),
+    deps: tuple = Depends(get_model)
+):
+    """
+    Process PDF query with semantic search and highlighting.
+    
+    Args:
+        file: PDF file to analyze
+        query: Search query
+        top_k: Number of top matches to return
+        deps: Model dependencies
+        
+    Returns:
+        ZIP file containing highlighted PDF and similarity scores
+    """
+    model, processor, device = deps
+    
+    try:
+        # Load spaCy for query analysis
+        nlp = spacy.load("en_core_web_sm")
+        
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp()
+        pdf_path = os.path.join(temp_dir, "input.pdf")
+        
+        # Save uploaded PDF
+        pdf_content = await file.read()
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_content)
+            
+        # Convert PDF to images and extract text
+        images, page_texts = get_pdf_images(pdf_path, is_local=True)
+        
+        # Extract key terms from query
+        key_terms = extract_key_terms(query, nlp)
+        print(f"Extracted key terms: {key_terms}")
+        
+        # Process each page
+        page_results = []
+        
+        for page_num, (image, page_text) in enumerate(zip(images, page_texts)):
+            try:
+                # Create batch for image
+                batch_images = processor.process_images([image]).to(device)
+                batch_queries = processor.process_queries([query]).to(device)
+                
+                # Generate embeddings
+                with torch.no_grad():
+                    image_embeddings = model.forward(**batch_images)
+                    query_embeddings = model.forward(**batch_queries)
+                
+                # Calculate similarity maps
+                n_patches = processor.get_n_patches(image_size=image.size, 
+                                                  patch_size=model.patch_size)
+                image_mask = processor.get_image_mask(batch_images)
+                
+                similarity_maps = get_similarity_maps_from_embeddings(
+                    image_embeddings=image_embeddings,
+                    query_embeddings=query_embeddings,
+                    n_patches=n_patches,
+                    image_mask=image_mask,
+                )[0]
+                
+                # Calculate overall similarity as max across all tokens
+                overall_similarity = float(similarity_maps.max().item())
+                
+                # Generate heatmap visualization
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps.max(dim=0)[0],  # Combine all token maps
+                    figsize=(12, 12),
+                    show_colorbar=True
+                )
+                
+                # Save heatmap image
+                heatmap_path = os.path.join(temp_dir, f"heatmap_{page_num}.png")
+                fig.savefig(heatmap_path, bbox_inches="tight", dpi=300)
+                plt.close(fig)
+                
+                page_results.append({
+                    "page_num": page_num,
+                    "similarity": overall_similarity,
+                    "text": page_text,
+                    "heatmap_path": heatmap_path
+                })
+                
+            except Exception as e:
+                print(f"Error processing page {page_num}: {str(e)}")
+                continue
+        
+        # Sort by similarity and get top_k pages
+        top_pages = sorted(page_results, key=lambda x: x["similarity"], 
+                         reverse=True)[:top_k]
+        
+        # Create results JSON
+        results = {
+            "top_matches": [
+                {
+                    "page_num": page["page_num"],
+                    "similarity": page["similarity"],
+                    "text_preview": page["text"][:200] + "..."
+                }
+                for page in top_pages
+            ]
+        }
+        
+        # Save results
+        with open(os.path.join(temp_dir, "results.json"), "w") as f:
+            json.dump(results, f, indent=2)
+        
+        # Create ZIP with results
+        zip_path = os.path.join(temp_dir, "results.zip")
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            # Add results JSON
+            zipf.write(os.path.join(temp_dir, "results.json"), "results.json")
+            
+            # Add heatmap images for top matches
+            for page in top_pages:
+                heatmap_name = f"heatmap_{page['page_num']}.png"
+                zipf.write(page["heatmap_path"], heatmap_name)
+        
+        # Setup cleanup
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(lambda: shutil.rmtree(temp_dir))
+        
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename="results.zip",
+            headers={"Content-Disposition": "attachment; filename=results.zip"},
+            background=background_tasks
+        )
+
+    except Exception as e:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        print(f"Error in PDF processing: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
 
