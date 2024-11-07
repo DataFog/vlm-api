@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from PIL import Image
 import io
 from typing import List, Optional
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from huggingface_hub import login
 import os
 import logging
@@ -49,6 +49,28 @@ from pdf2image import convert_from_path
 import spacy
 from transformers import AutoTokenizer
 import json
+from functools import lru_cache
+from datetime import datetime, timedelta
+import time
+import asyncio
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form, BackgroundTasks, Response
+from fastapi.responses import StreamingResponse
+import asyncio
+from typing import List, Dict
+import tempfile
+import os
+import json
+import zipfile
+from PIL import Image
+import torch
+import io
+from pdf2image import convert_from_path
+from PyPDF2 import PdfReader
+import logging
+from tqdm import tqdm
+import uuid
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 def download_pdf(url):
     response = requests.get(url)
     if response.status_code == 200:
@@ -95,6 +117,18 @@ def get_pdf_images(pdf_path, is_local=True):
         print(f"PDF processing error: {str(e)}")
         raise
 
+async def get_pdf_images_stream(pdf_path):
+    reader = PdfReader(pdf_path)
+    for page_num in range(len(reader.pages)):
+        # Process one page at a time
+        images = convert_from_path(
+            pdf_path,
+            first_page=page_num+1,
+            last_page=page_num+1,
+            dpi=200
+        )
+        yield images[0], reader.pages[page_num].extract_text()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
@@ -113,55 +147,107 @@ class QueryRequest(BaseModel):
     query: str
     token_idx: Optional[int] = None
 
+# Add context managers for cleanup
+@contextmanager
+def manage_temp_resources():
+    temp_dir = tempfile.mkdtemp()
+    try:
+        yield temp_dir
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        torch.cuda.empty_cache()  # Clear CUDA cache
+
+class ModelCache:
+    def __init__(self, ttl_minutes=60):
+        self.model = None
+        self.processor = None
+        self.device = None
+        self.nlp = None
+        self.last_access = None
+        self.ttl = timedelta(minutes=ttl_minutes)
+        self._lock = asyncio.Lock()
+
+    async def get_or_load(self):
+        async with self._lock:
+            now = datetime.now()
+            
+            # Check if cache is expired
+            if (self.last_access and 
+                now - self.last_access > self.ttl):
+                self.clear()
+
+            # Load if needed
+            if not self.model:
+                await self.load_models()
+            
+            self.last_access = now
+            return (self.model, self.processor, self.device)
+
+    async def load_models(self):
+        logging.info("Loading models into cache...")
+        
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise RuntimeError("HF_TOKEN environment variable not set")
+        
+        login(token=hf_token)
+        
+        model_name = "vidore/colpali-v1.2"
+        self.device = get_torch_device("auto")
+        
+        # Set tokenizer parallelism before loading models
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
+        self.model = ColPali.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=self.device,
+        ).eval()
+        
+        self.processor = ColPaliProcessor.from_pretrained(model_name)
+        
+        # Pre-format processor with default tokens
+        self.processor.default_image_token = "<image>"
+        self.processor.default_bos_token = "<bos>"
+        
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            os.system("python -m spacy download en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+
+    def clear(self):
+        logging.info("Clearing model cache")
+        if self.model:
+            self.model.cpu()
+        self.model = None
+        self.processor = None
+        self.nlp = None
+        torch.cuda.empty_cache()
+
+# Initialize cache
+model_cache = ModelCache()
+
+# Replace get_model dependency with cached version
+async def get_model():
+    """Dependency that provides cached access to model components."""
+    try:
+        return await model_cache.get_or_load()
+    except Exception as e:
+        logging.error(f"Error loading model: {str(e)}")
+        raise HTTPException(status_code=503, detail="Model loading failed")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manages model lifecycle during application startup and shutdown.
-    
-    Requires:
-        - HF_TOKEN environment variable must be set
-        
-    Effects:
-        - Initializes global model, processor and device on startup
-        - Cleans up resources on shutdown
-        
-    Args:
-        app (FastAPI): FastAPI application instance
-    """
-    global model, processor, device, nlp
-    
-    # Startup
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise RuntimeError("HF_TOKEN environment variable not set")
-    
-    login(token=hf_token)
-    
-    model_name = "vidore/colpali-v1.2"
-    device = get_torch_device("auto")
-    
-    print(f"Loading model on device: {device}")
-    model = ColPali.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-    ).eval()
-    
-    processor = ColPaliProcessor.from_pretrained(model_name)
-    
-    print("Loading spaCy model...")
+    """Manages model lifecycle during application startup and shutdown."""
     try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        print("Installing spacy model...")
-        os.system("python -m spacy download en_core_web_sm")
-        nlp = spacy.load("en_core_web_sm")
-    
-    yield
-    
-    # Shutdown cleanup
-    model = None
-    processor = None
-    nlp = None
+        # Warm up cache on startup
+        await model_cache.get_or_load()
+        yield
+    finally:
+        # Cleanup on shutdown
+        model_cache.clear()
 app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
@@ -172,19 +258,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-async def get_model():
-    """Dependency that provides access to model components.
-    
-    Returns:
-        tuple: (model, processor, device) tuple
-        
-    Raises:
-        HTTPException: If model is not loaded
-    """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return model, processor, device
 
 @app.post("/query/single")
 async def query_image(
@@ -227,10 +300,13 @@ async def query_image(
         image = Image.open(io.BytesIO(image_content))
         print(f"Loaded image with size: {image.size}")
         
+        # Format query with proper tokens
+        formatted_query = f"<image><bos>{query}"
+        
         # Preprocess inputs
         print("Preprocessing inputs...")
         batch_images = processor.process_images([image]).to(device)
-        batch_queries = processor.process_queries([query]).to(device)
+        batch_queries = processor.process_queries([formatted_query]).to(device)
         
         # Generate embeddings
         print("Running model inference...")
@@ -440,190 +516,257 @@ def extract_key_terms(query: str, nlp) -> List[str]:
     
     return key_terms
 
-def create_highlighted_pdf(original_pdf_path: str, 
-                         highlights: List[Dict],
-                         output_path: str):
-    """Create a new PDF with highlights overlaid on matching pages."""
-    reader = PdfReader(original_pdf_path)
-    writer = PdfWriter()
-    
-    for page_num in range(len(reader.pages)):
-        page = reader.pages[page_num]
-        page_highlights = [h for h in highlights if h["page_num"] == page_num]
+# Add this new route for status checking
+class ProcessingStatus:
+    def __init__(self):
+        self.current_status = {}
         
-        if page_highlights:
-            # Create highlight layer
-            packet = io.BytesIO()
-            can = canvas.Canvas(packet)
+    def update_status(self, job_id: str, status: dict):
+        self.current_status[job_id] = status
+        
+    def get_status(self, job_id: str) -> dict:
+        return self.current_status.get(job_id, {})
+
+processing_status = ProcessingStatus()
+
+async def process_pdf_chunks(
+    pdf_path: str,
+    query: str,
+    job_id: str,
+    model,
+    processor,
+    device,
+    chunk_size: int = 5
+) -> List[Dict]:
+    """Process PDF in chunks to avoid memory issues."""
+    results = []
+    
+    # Format query properly with tokens
+    formatted_query = f"<image><bos>{query}"
+    
+    # Get total number of pages
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+    
+    # Process in chunks
+    for start_idx in range(0, total_pages, chunk_size):
+        end_idx = min(start_idx + chunk_size, total_pages)
+        
+        # Update status
+        processing_status.update_status(job_id, {
+            "status": "processing",
+            "progress": f"{start_idx}/{total_pages}",
+            "message": f"Processing pages {start_idx+1} to {end_idx}"
+        })
+        
+        try:
+            images = convert_from_path(
+                pdf_path,
+                first_page=start_idx + 1,
+                last_page=end_idx,
+                dpi=150,
+                thread_count=4
+            )
             
-            for highlight in page_highlights:
-                # Convert normalized coordinates to PDF coordinates
-                x, y = highlight["bbox"]
-                width = page.mediabox.width
-                height = page.mediabox.height
+            # Extract text for these pages
+            chunk_texts = [reader.pages[i].extract_text() for i in range(start_idx, end_idx)]
+            
+            # Process images and properly formatted query
+            batch_images_processed = processor.process_images(images).to(device)
+            batch_queries = processor.process_queries([formatted_query] * len(images)).to(device)
+            
+            with torch.no_grad():
+                image_embeddings = model.forward(**batch_images_processed)
+                query_embeddings = model.forward(**batch_queries)
                 
-                # Draw semi-transparent yellow highlight
-                can.setFillColor(Color(1, 1, 0, alpha=0.3))
-                can.rect(x * width, y * height, 
-                        highlight["width"] * width,
-                        highlight["height"] * height,
-                        fill=True, stroke=False)
+                image_mask = processor.get_image_mask(batch_images_processed)
+                
+                for j, (image, embedding) in enumerate(zip(images, image_embeddings)):
+                    page_idx = start_idx + j
+                    n_patches = processor.get_n_patches(
+                        image_size=image.size,
+                        patch_size=model.patch_size
+                    )
+                    
+                    similarity_maps = get_similarity_maps_from_embeddings(
+                        image_embeddings=embedding.unsqueeze(0),
+                        query_embeddings=query_embeddings[j].unsqueeze(0),
+                        n_patches=n_patches,
+                        image_mask=image_mask[j:j+1]
+                    )[0]
+                    
+                    results.append({
+                        "page_num": page_idx,
+                        "similarity": float(similarity_maps.max().item()),
+                        "text": chunk_texts[j]
+                    })
             
-            can.save()
-            packet.seek(0)
+            # Clear GPU memory after each chunk
+            torch.cuda.empty_cache()
             
-            # Merge highlight layer with original page
-            highlight_pdf = PdfReader(packet)
-            page.merge_page(highlight_pdf.pages[0])
-        
-        writer.add_page(page)
+            # Give other tasks a chance to run
+            await asyncio.sleep(0)
+            
+        except Exception as e:
+            logging.error(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
+            continue
     
-    with open(output_path, "wb") as output_file:
-        writer.write(output_file)
+    return results
 
 @app.post("/query/pdf")
 async def query_pdf(
     file: UploadFile = File(...),
     query: str = Form(...),
     top_k: int = Form(3),
-    deps: tuple = Depends(get_model)
+    deps: tuple = Depends(get_model),
 ):
-    """
-    Process PDF query with semantic search and highlighting.
-    
-    Args:
-        file: PDF file to analyze
-        query: Search query
-        top_k: Number of top matches to return
-        deps: Model dependencies
-        
-    Returns:
-        ZIP file containing highlighted PDF and similarity scores
-    """
+    """Process PDF with progress monitoring and chunked processing."""
     model, processor, device = deps
+    job_id = str(uuid.uuid4())
+
+    # Format query properly with tokens
+    formatted_query = f"<image><bos>{query}"
+    
+    processing_status.update_status(job_id, {
+        "status": "starting",
+        "progress": "0%",
+        "message": "Initializing PDF processing"
+    })
     
     try:
-        # Load spaCy for query analysis
-        nlp = spacy.load("en_core_web_sm")
-        
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp()
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        
-        # Save uploaded PDF
-        pdf_content = await file.read()
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_content)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save PDF
+            pdf_path = os.path.join(temp_dir, "input.pdf")
+            with open(pdf_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
             
-        # Convert PDF to images and extract text
-        images, page_texts = get_pdf_images(pdf_path, is_local=True)
-        
-        # Extract key terms from query
-        key_terms = extract_key_terms(query, nlp)
-        print(f"Extracted key terms: {key_terms}")
-        
-        # Process each page
-        page_results = []
-        
-        for page_num, (image, page_text) in enumerate(zip(images, page_texts)):
-            try:
-                # Create batch for image
-                batch_images = processor.process_images([image]).to(device)
-                batch_queries = processor.process_queries([query]).to(device)
+            # Process PDF in chunks
+            page_results = await process_pdf_chunks(
+                pdf_path=pdf_path,
+                query=query,
+                job_id=job_id,
+                model=model,
+                processor=processor,
+                device=device
+            )
+            
+            # Get top matches
+            top_pages = sorted(
+                page_results,
+                key=lambda x: x["similarity"],
+                reverse=True
+            )[:top_k]
+            
+            # Prepare results
+            results_data = {
+                "query": query,
+                "total_pages": len(page_results),
+                "top_matches": []
+            }
+            
+            # Generate heatmaps only for top matches
+            for page in top_pages:
+                page_num = page["page_num"]
                 
-                # Generate embeddings
-                with torch.no_grad():
-                    image_embeddings = model.forward(**batch_images)
-                    query_embeddings = model.forward(**batch_queries)
-                
-                # Calculate similarity maps
-                n_patches = processor.get_n_patches(image_size=image.size, 
-                                                  patch_size=model.patch_size)
-                image_mask = processor.get_image_mask(batch_images)
-                
-                similarity_maps = get_similarity_maps_from_embeddings(
-                    image_embeddings=image_embeddings,
-                    query_embeddings=query_embeddings,
-                    n_patches=n_patches,
-                    image_mask=image_mask,
-                )[0]
-                
-                # Calculate overall similarity as max across all tokens
-                overall_similarity = float(similarity_maps.max().item())
-                
-                # Generate heatmap visualization
-                fig, ax = plot_similarity_map(
-                    image=image,
-                    similarity_map=similarity_maps.max(dim=0)[0],  # Combine all token maps
-                    figsize=(12, 12),
-                    show_colorbar=True
-                )
-                
-                # Save heatmap image
-                heatmap_path = os.path.join(temp_dir, f"heatmap_{page_num}.png")
-                fig.savefig(heatmap_path, bbox_inches="tight", dpi=300)
-                plt.close(fig)
-                
-                page_results.append({
-                    "page_num": page_num,
-                    "similarity": overall_similarity,
-                    "text": page_text,
-                    "heatmap_path": heatmap_path
+                processing_status.update_status(job_id, {
+                    "status": "generating_heatmaps",
+                    "progress": f"Processing page {page_num + 1}",
+                    "message": "Generating heatmaps for top matches"
                 })
                 
-            except Exception as e:
-                print(f"Error processing page {page_num}: {str(e)}")
-                continue
-        
-        # Sort by similarity and get top_k pages
-        top_pages = sorted(page_results, key=lambda x: x["similarity"], 
-                         reverse=True)[:top_k]
-        
-        # Create results JSON
-        results = {
-            "top_matches": [
-                {
-                    "page_num": page["page_num"],
-                    "similarity": page["similarity"],
-                    "text_preview": page["text"][:200] + "..."
-                }
-                for page in top_pages
-            ]
-        }
-        
-        # Save results
-        with open(os.path.join(temp_dir, "results.json"), "w") as f:
-            json.dump(results, f, indent=2)
-        
-        # Create ZIP with results
-        zip_path = os.path.join(temp_dir, "results.zip")
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            # Add results JSON
-            zipf.write(os.path.join(temp_dir, "results.json"), "results.json")
+                # Generate heatmap for this page
+                image = convert_from_path(
+                    pdf_path,
+                    first_page=page_num + 1,
+                    last_page=page_num + 1,
+                    dpi=150
+                )[0]
+                
+                # Generate and save heatmap
+                batch_image = processor.process_images([image]).to(device)
+                batch_query = processor.process_queries([formatted_query]).to(device)
+                
+                with torch.no_grad():
+                    image_embedding = model.forward(**batch_image)
+                    query_embedding = model.forward(**batch_query)
+                    
+                    n_patches = processor.get_n_patches(
+                        image_size=image.size,
+                        patch_size=model.patch_size
+                    )
+                    image_mask = processor.get_image_mask(batch_image)
+                    
+                    similarity_maps = get_similarity_maps_from_embeddings(
+                        image_embeddings=image_embedding,
+                        query_embeddings=query_embedding,
+                        n_patches=n_patches,
+                        image_mask=image_mask,
+                    )[0]
+                
+                # Save heatmap
+                heatmap_path = os.path.join(temp_dir, f"page_{page_num}.png")
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps.max(dim=0).values,
+                    figsize=(8, 8),
+                    show_colorbar=False,
+                )
+                fig.savefig(heatmap_path, bbox_inches="tight")
+                plt.close(fig)
+                
+                # Add to results
+                results_data["top_matches"].append({
+                    "page_number": page_num,
+                    "similarity_score": float(page["similarity"]),
+                    "page_text": page["text"]
+                })
+                
+                torch.cuda.empty_cache()
             
-            # Add heatmap images for top matches
-            for page in top_pages:
-                heatmap_name = f"heatmap_{page['page_num']}.png"
-                zipf.write(page["heatmap_path"], heatmap_name)
-        
-        # Setup cleanup
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(lambda: shutil.rmtree(temp_dir))
-        
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename="results.zip",
-            headers={"Content-Disposition": "attachment; filename=results.zip"},
-            background=background_tasks
-        )
-
+            # Create ZIP file
+            zip_path = os.path.join(temp_dir, "results.zip")
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                # Add results.json
+                results_json_path = os.path.join(temp_dir, "results.json")
+                with open(results_json_path, 'w') as f:
+                    json.dump(results_data, f, indent=2)
+                zipf.write(results_json_path, "results.json")
+                
+                # Add heatmaps
+                for filename in os.listdir(temp_dir):
+                    if filename.startswith("page_") and filename.endswith(".png"):
+                        zipf.write(
+                            os.path.join(temp_dir, filename),
+                            f"heatmaps/{filename}"
+                        )
+            
+            # Stream the response
+            return StreamingResponse(
+                open(zip_path, "rb"),
+                media_type="application/zip",
+                headers={"Content-Disposition": "attachment; filename=results.zip"}
+            )
+            
     except Exception as e:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        print(f"Error in PDF processing: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        logging.error(f"Error processing PDF: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing PDF: {str(e)}"
+        )
+    finally:
+        # Cleanup status
+        if job_id in processing_status.current_status:
+            del processing_status.current_status[job_id]
+
+# Add status endpoint
+@app.get("/query/pdf/status/{job_id}")
+async def get_processing_status(job_id: str):
+    status = processing_status.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
+
 
 if __name__ == "__main__":
     import uvicorn
