@@ -69,6 +69,12 @@ from PyPDF2 import PdfReader
 import logging
 from tqdm import tqdm
 import uuid
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+from functools import partial
+import asyncio
+from itertools import islice
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def download_pdf(url):
@@ -529,6 +535,29 @@ class ProcessingStatus:
 
 processing_status = ProcessingStatus()
 
+def process_page_chunk(
+    pdf_path: str,
+    page_numbers: List[int],
+    dpi: int = 100  # Reduced DPI
+) -> List[Image.Image]:
+    """Process a chunk of PDF pages in parallel."""
+    return convert_from_path(
+        pdf_path,
+        first_page=min(page_numbers) + 1,
+        last_page=max(page_numbers) + 1,
+        dpi=dpi,
+        thread_count=1  # Use 1 thread per worker as we're already parallel
+    )
+
+def batch_generator(iterable, batch_size):
+    """Generate batches from an iterable."""
+    iterator = iter(iterable)
+    while True:
+        batch = list(islice(iterator, batch_size))
+        if not batch:
+            break
+        yield batch
+
 async def process_pdf_chunks(
     pdf_path: str,
     query: str,
@@ -536,9 +565,10 @@ async def process_pdf_chunks(
     model,
     processor,
     device,
-    chunk_size: int = 5
+    chunk_size: int = 2,  # Reduced chunk size
+    dpi: int = 100  # Reduced DPI
 ) -> List[Dict]:
-    """Process PDF in chunks to avoid memory issues."""
+    """Process PDF in chunks with parallel processing."""
     results = []
     
     # Format query properly with tokens
@@ -548,68 +578,68 @@ async def process_pdf_chunks(
     reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
     
-    # Process in chunks
-    for start_idx in range(0, total_pages, chunk_size):
-        end_idx = min(start_idx + chunk_size, total_pages)
-        
-        # Update status
-        processing_status.update_status(job_id, {
-            "status": "processing",
-            "progress": f"{start_idx}/{total_pages}",
-            "message": f"Processing pages {start_idx+1} to {end_idx}"
-        })
-        
-        try:
-            images = convert_from_path(
-                pdf_path,
-                first_page=start_idx + 1,
-                last_page=end_idx,
-                dpi=150,
-                thread_count=4
-            )
+    # Create page number chunks
+    page_chunks = list(batch_generator(range(total_pages), chunk_size))
+    
+    # Process page chunks in parallel
+    with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 4)) as executor:
+        for chunk_idx, page_numbers in enumerate(page_chunks):
+            processing_status.update_status(job_id, {
+                "status": "processing",
+                "progress": f"{chunk_idx * chunk_size}/{total_pages}",
+                "message": f"Processing pages {min(page_numbers)+1} to {max(page_numbers)+1}"
+            })
             
-            # Extract text for these pages
-            chunk_texts = [reader.pages[i].extract_text() for i in range(start_idx, end_idx)]
-            
-            # Process images and properly formatted query
-            batch_images_processed = processor.process_images(images).to(device)
-            batch_queries = processor.process_queries([formatted_query] * len(images)).to(device)
-            
-            with torch.no_grad():
-                image_embeddings = model.forward(**batch_images_processed)
-                query_embeddings = model.forward(**batch_queries)
+            try:
+                # Process images in parallel
+                process_func = partial(process_page_chunk, pdf_path, page_numbers, dpi)
+                images = await asyncio.get_event_loop().run_in_executor(executor, process_func)
                 
-                image_mask = processor.get_image_mask(batch_images_processed)
+                # Extract text for these pages
+                chunk_texts = [reader.pages[i].extract_text() for i in page_numbers]
                 
-                for j, (image, embedding) in enumerate(zip(images, image_embeddings)):
-                    page_idx = start_idx + j
-                    n_patches = processor.get_n_patches(
-                        image_size=image.size,
-                        patch_size=model.patch_size
-                    )
+                # Optimize batch processing
+                batch_size = 2  # Process 2 images at a time to manage memory
+                for i in range(0, len(images), batch_size):
+                    batch_images = images[i:i + batch_size]
                     
-                    similarity_maps = get_similarity_maps_from_embeddings(
-                        image_embeddings=embedding.unsqueeze(0),
-                        query_embeddings=query_embeddings[j].unsqueeze(0),
-                        n_patches=n_patches,
-                        image_mask=image_mask[j:j+1]
-                    )[0]
+                    # Process images and query
+                    batch_images_processed = processor.process_images(batch_images).to(device)
+                    batch_queries = processor.process_queries([formatted_query] * len(batch_images)).to(device)
                     
-                    results.append({
-                        "page_num": page_idx,
-                        "similarity": float(similarity_maps.max().item()),
-                        "text": chunk_texts[j]
-                    })
-            
-            # Clear GPU memory after each chunk
-            torch.cuda.empty_cache()
-            
-            # Give other tasks a chance to run
-            await asyncio.sleep(0)
-            
-        except Exception as e:
-            logging.error(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
-            continue
+                    with torch.no_grad():
+                        image_embeddings = model.forward(**batch_images_processed)
+                        query_embeddings = model.forward(**batch_queries)
+                        
+                        image_mask = processor.get_image_mask(batch_images_processed)
+                        
+                        for j, (image, embedding) in enumerate(zip(batch_images, image_embeddings)):
+                            page_idx = page_numbers[i + j]
+                            n_patches = processor.get_n_patches(
+                                image_size=image.size,
+                                patch_size=model.patch_size
+                            )
+                            
+                            similarity_maps = get_similarity_maps_from_embeddings(
+                                image_embeddings=embedding.unsqueeze(0),
+                                query_embeddings=query_embeddings[j].unsqueeze(0),
+                                n_patches=n_patches,
+                                image_mask=image_mask[j:j+1]
+                            )[0]
+                            
+                            results.append({
+                                "page_num": page_idx,
+                                "similarity": float(similarity_maps.max().item()),
+                                "text": chunk_texts[i + j]
+                            })
+                    
+                    # Clear GPU memory after each batch
+                    torch.cuda.empty_cache()
+                    await asyncio.sleep(0)
+                
+            except Exception as e:
+                logging.error(f"Error processing chunk {chunk_idx}: {str(e)}")
+                continue
     
     return results
 
@@ -618,12 +648,13 @@ async def query_pdf(
     file: UploadFile = File(...),
     query: str = Form(...),
     top_k: int = Form(3),
+    dpi: int = Form(100),  # Allow DPI customization
     deps: tuple = Depends(get_model),
 ):
-    """Process PDF with progress monitoring and chunked processing."""
+    """Process PDF with optimized performance."""
     model, processor, device = deps
     job_id = str(uuid.uuid4())
-
+    
     # Format query properly with tokens
     formatted_query = f"<image><bos>{query}"
     
@@ -641,15 +672,20 @@ async def query_pdf(
                 content = await file.read()
                 f.write(content)
             
-            # Process PDF in chunks
+            # Process PDF in optimized chunks
             page_results = await process_pdf_chunks(
                 pdf_path=pdf_path,
                 query=query,
                 job_id=job_id,
                 model=model,
                 processor=processor,
-                device=device
+                device=device,
+                chunk_size=2,  # Process 2 pages at a time
+                dpi=dpi
             )
+            
+            if not page_results:
+                raise HTTPException(status_code=500, detail="No results generated from PDF processing")
             
             # Get top matches
             top_pages = sorted(
@@ -665,22 +701,16 @@ async def query_pdf(
                 "top_matches": []
             }
             
-            # Generate heatmaps only for top matches
-            for page in top_pages:
+            # Generate heatmaps only for top matches in parallel
+            async def process_top_match(page):
                 page_num = page["page_num"]
-                
-                processing_status.update_status(job_id, {
-                    "status": "generating_heatmaps",
-                    "progress": f"Processing page {page_num + 1}",
-                    "message": "Generating heatmaps for top matches"
-                })
                 
                 # Generate heatmap for this page
                 image = convert_from_path(
                     pdf_path,
                     first_page=page_num + 1,
                     last_page=page_num + 1,
-                    dpi=150
+                    dpi=dpi
                 )[0]
                 
                 # Generate and save heatmap
@@ -715,14 +745,15 @@ async def query_pdf(
                 fig.savefig(heatmap_path, bbox_inches="tight")
                 plt.close(fig)
                 
-                # Add to results
-                results_data["top_matches"].append({
+                return {
                     "page_number": page_num,
                     "similarity_score": float(page["similarity"]),
                     "page_text": page["text"]
-                })
-                
-                torch.cuda.empty_cache()
+                }
+            
+            # Process top matches in parallel
+            tasks = [process_top_match(page) for page in top_pages]
+            results_data["top_matches"] = await asyncio.gather(*tasks)
             
             # Create ZIP file
             zip_path = os.path.join(temp_dir, "results.zip")
@@ -755,7 +786,6 @@ async def query_pdf(
             detail=f"Error processing PDF: {str(e)}"
         )
     finally:
-        # Cleanup status
         if job_id in processing_status.current_status:
             del processing_status.current_status[job_id]
 
