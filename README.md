@@ -56,8 +56,13 @@ ZIP file containing highlighted PDF and similarity scores titled result.zip
 ## Setup
 
 ```bash
-docker build -t vlm-api .
-docker run -p 8000:8000 --env-file .env vlm-api
+git clone https://github.com/DataFog/vlm-api
+cd vlm-api
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 300 --limit-max-requests 1000 --loop uvloop --reload
+
 ```
 
 
