@@ -26,3 +26,12 @@ app/.venv/
 *.jpg
 *.jpeg
 *.gif
+*.zip
+*.json
+__pycache__/
+results/
+app/results/
+app/app.log
+Dockerfile
+docker-entrypoint.sh
+package copy.json
