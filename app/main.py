@@ -640,7 +640,8 @@ async def process_pdf_chunks(
             except Exception as e:
                 logging.error(f"Error processing chunk {chunk_idx}: {str(e)}")
                 continue
-    
+        
+        executor.shutdown(wait=True)
     return results
 
 @app.post("/query/pdf")
@@ -648,7 +649,7 @@ async def query_pdf(
     file: UploadFile = File(...),
     query: str = Form(...),
     top_k: int = Form(3),
-    dpi: int = Form(100),  # Allow DPI customization
+    dpi: int = Form(300),  # Allow DPI customization
     deps: tuple = Depends(get_model),
 ):
     """Process PDF with optimized performance."""
@@ -800,4 +801,18 @@ async def get_processing_status(job_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import multiprocessing
+    
+    # Add cleanup handler
+    multiprocessing.set_start_method('fork')  # Use 'spawn' on Windows
+    
+    # Modify server config
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000, 
+        workers=2, 
+        timeout=300, 
+        limit_max_requests=1000,
+        loop="uvloop"  # More efficient event loop
+    )
